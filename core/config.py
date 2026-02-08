@@ -112,6 +112,15 @@ class PromptEntry(ConfigNode):
     command: str
     content: str
 
+    def __init__(self, data: dict[str, Any]):
+        super().__init__(data)
+  
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "content": self.content,
+        }
+
 
 class LLMConfig(ConfigNode):
     provider_id: str
@@ -152,6 +161,9 @@ class PluginConfig(ConfigNode):
 
         self.data_dir = StarTools.get_data_dir(self._plugin_name)
         self.plugin_dir = Path(get_astrbot_plugin_path()) / self._plugin_name
+        self.style_dir = self.plugin_dir / "pillowmd_style"
+        self.cache_dir = self.data_dir / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.builtin_prompt_file = self.plugin_dir / "builtin_prompts.yaml"
 
         # 加载用户配置
@@ -188,3 +200,38 @@ class PluginConfig(ConfigNode):
         for entry in self.entries:
             if entry.command == message:
                 return entry.content
+
+    def query_prompt_entries(self, command: str | None = None) -> list[PromptEntry]:
+        """查询 PromptEntry"""
+        if command:
+            return [e for e in self.entries if e.command == command]
+        return list(self.entries)
+
+    def render_prompt_entries(self, command: str | None = None) -> str:
+        """
+        以 Markdown 格式展示 PromptEntry
+        - command 为空：展示所有
+        - command 指定：仅展示对应条目
+        """
+        if command:
+            entries = [e for e in self.entries if e.command == command]
+            if not entries:
+                return f"### 未找到命令：`{command}`"
+        else:
+            entries = self.entries
+
+        blocks: list[str] = []
+
+        for entry in entries:
+            block = "\n".join(
+                [
+                    f"## `{entry.command}`",
+                    "",
+                    "```text",
+                    entry.content.rstrip(),
+                    "```",
+                ]
+            )
+            blocks.append(block)
+
+        return "\n\n".join(blocks)
