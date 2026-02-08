@@ -126,11 +126,10 @@ class PluginConfig(ConfigNode):
         self.cache_ttl = self.cache_ttl_min * 60
         self.max_query_rounds = 200
         self.per_query_count = 200
-
-        self.llm_retry_interval: float =  1.0
-
     def get_query_rounds(self, rounds=None) -> int:
         """获取查询轮数"""
+        if rounds and str(rounds).isdigit():
+            rounds = int(rounds)
         if not isinstance(rounds, int) or rounds <= 0 or rounds > self.max_query_rounds:
             return self.default_query_rounds
         return rounds
