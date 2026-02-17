@@ -115,16 +115,29 @@ class PortrayalPlugin(Star):
         history[str(target_id)] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._save_history(history)
 
-    @staticmethod
-    def get_at_id(event: AiocqhttpMessageEvent) -> str | None:
-        return next(
-            (
-                str(seg.qq)
-                for seg in event.get_messages()
-                if (isinstance(seg, At)) and str(seg.qq) != event.get_self_id()
-            ),
-            None,
-        )
+    def _get_target_id(self, event: AiocqhttpMessageEvent) -> str | None:
+        """
+        获取分析目标ID
+        逻辑：优先返回被 @ 的其他群友；
+        如果没有群友被 @，但 Bot 自己被 @ 了，且配置允许分析Bot，则返回 Bot ID
+        """
+        self_id = event.get_self_id()
+        at_list = [
+            str(seg.qq) 
+            for seg in event.get_messages() 
+            if isinstance(seg, At)
+        ]
+        
+        # 优先返回非 Bot 的 QQ
+        for qq in at_list:
+            if qq != self_id:
+                return qq
+        
+        # 如果配置允许，且列表中包含 Bot ID，则返回 Bot ID
+        if self.cfg.message.allow_analyze_self and self_id in at_list:
+            return self_id
+            
+        return None
 
     async def send(self, event: AiocqhttpMessageEvent, message: str):
         if self.style:
@@ -145,7 +158,13 @@ class PortrayalPlugin(Star):
         prompt = self.entry_service.match_prompt_by_cmd(cmd)
         if not prompt:
             return
-        target_id = self.get_at_id(event) or event.get_sender_id()
+            
+        # 获取目标ID
+        target_id = self._get_target_id(event)
+        
+        # 如果没有指定人，也没有触发 Bot 分析，则默认分析发送者
+        if not target_id:
+            target_id = event.get_sender_id()
 
         # ---------- 检查冷却 ----------
         can_proceed, msg = self._check_cooldown(target_id)
@@ -206,3 +225,4 @@ class PortrayalPlugin(Star):
             yield event.plain_result(f"提示词【{command}】不存在")
             return
         await self.send(event, text)
+        

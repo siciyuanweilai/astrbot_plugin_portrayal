@@ -125,7 +125,8 @@ class MessageConfig(ConfigNode):
     max_msg_count: int
     cache_ttl_min: int
     analysis_cooldown: float
-    context_num: int  
+    context_num: int
+    allow_analyze_self: bool  
 
     def __init__(self, data: dict[str, Any]):
         super().__init__(data)
