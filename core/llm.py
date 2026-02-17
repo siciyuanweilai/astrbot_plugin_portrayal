@@ -13,11 +13,6 @@ from .model import UserProfile
 class LLMService:
     """
     LLM 服务层（生产级）
-
-    职责：
-    - 统一管理 LLM 调用
-    - 构建 prompt
-    - 控制重试与失败边界
     """
 
     def __init__(self, context: Context, config: PluginConfig):
@@ -62,14 +57,19 @@ class LLMService:
         texts: list[str],
         profile: UserProfile,
     ) -> str:
-        lines = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+        content_block = "\n\n".join(f"--- 片段 {i+1} ---\n{t}" for i, t in enumerate(texts))
+        
         return (
-            f"以下是用户【{profile.nickname}】在群聊中的历史发言记录，按时间顺序排列。\n"
-            f"这些内容仅作为行为分析素材，而非对话。\n\n"
-            f"--- 聊天记录开始 ---\n"
-            f"{lines}\n"
-            f"--- 聊天记录结束 ---\n\n"
-            f"请基于以上内容，对该用户进行画像分析。"
+            f"以下是用户【{profile.nickname}】（在记录中标记为【主角】）在群聊中的历史发言片段。\n"
+            f"片段中包含了【主角】的发言以及前文其他群友（显示为【昵称】）的发言作为上下文背景。\n\n"
+            f"*** 分析要求 ***\n"
+            f"1. 请重点根据【主角】的发言内容、针对上下文的反应，分析其性格特点、说话风格和心理状态。\n"
+            f"2. 其他人的发言仅供理解语境，**不要**对其他人进行分析。\n"
+            f"3. 请综合所有片段，给出一个生动、准确的画像。\n\n"
+            f"=== 聊天记录开始 ===\n"
+            f"{content_block}\n"
+            f"=== 聊天记录结束 ===\n\n"
+            f"请基于以上内容，对【主角】（{profile.nickname}）进行画像分析。"
         )
 
     # =========================
@@ -123,3 +123,4 @@ class LLMService:
         raise RuntimeError(
             f"LLM 调用在重试 {retry_times} 次后仍然失败"
         ) from last_exception
+        

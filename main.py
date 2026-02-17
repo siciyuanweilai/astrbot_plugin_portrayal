@@ -1,3 +1,6 @@
+import json
+import time
+from datetime import datetime
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
@@ -22,6 +25,7 @@ class PortrayalPlugin(Star):
         self.entry_service = EntryService(self.cfg)
         self.llm = LLMService(context, self.cfg)
         self.style = None
+        self.history_file = self.cfg.data_dir / "analysis_history.json"
 
     async def initialize(self):
         """加载插件时调用"""
@@ -34,6 +38,82 @@ class PortrayalPlugin(Star):
 
     async def terminate(self):
         self.msg.clear_cache()
+
+    def _get_history(self) -> dict:
+        """读取历史记录"""
+        if not self.history_file.exists():
+            return {}
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"读取画像历史记录失败: {e}")
+            return {}
+
+    def _save_history(self, data: dict):
+        """保存历史记录"""
+        try:
+            self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存画像历史记录失败: {e}")
+
+    def _check_cooldown(self, target_id: str) -> tuple[bool, str]:
+        """
+        检查用户是否在冷却中
+        配置单位：天
+        返回: (是否通过, 提示信息)
+        """
+        cooldown_days = self.cfg.message.analysis_cooldown
+        if cooldown_days <= 0:
+            return True, ""
+        
+        cooldown_seconds = cooldown_days * 24 * 60 * 60
+        
+        history = self._get_history()
+        last_time_str = history.get(str(target_id))
+        
+        if not last_time_str:
+            return True, ""
+
+        try:
+            dt_obj = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
+            last_timestamp = dt_obj.timestamp()
+        except ValueError:
+            return True, ""
+
+        current_time = time.time()
+        
+        if current_time - last_timestamp < cooldown_seconds:
+            remaining_seconds = int(cooldown_seconds - (current_time - last_timestamp))
+            
+            d, remainder = divmod(remaining_seconds, 86400)
+            h, remainder = divmod(remainder, 3600)
+            m, s = divmod(remainder, 60)
+            
+            time_parts = []
+            if d > 0: time_parts.append(f"{d}天")
+            if h > 0: time_parts.append(f"{h}小时")
+            if m > 0: time_parts.append(f"{m}分")
+            
+            if not time_parts:
+                time_str = f"{s}秒"
+            else:
+                time_str = "".join(time_parts)
+
+            return False, f"该群友在{cooldown_days}天内已被分析过了，请等待{time_str}后再试。"
+            
+        return True, ""
+
+    def _update_cooldown(self, target_id: str):
+        """更新用户的上次分析时间"""
+        if self.cfg.message.analysis_cooldown <= 0:
+            return
+            
+        history = self._get_history()
+        history[str(target_id)] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._save_history(history)
 
     @staticmethod
     def get_at_id(event: AiocqhttpMessageEvent) -> str | None:
@@ -67,6 +147,12 @@ class PortrayalPlugin(Star):
             return
         target_id = self.get_at_id(event) or event.get_sender_id()
 
+        # ---------- 检查冷却 ----------
+        can_proceed, msg = self._check_cooldown(target_id)
+        if not can_proceed:
+            yield event.plain_result(msg)
+            return
+
         # ---------- 用户画像 ----------
         profile = await self.profile_service.get_profile(event, target_id)
 
@@ -75,7 +161,7 @@ class PortrayalPlugin(Star):
         query_rounds = self.cfg.message.get_query_rounds(end_param)
 
         yield event.plain_result(
-            f"正在发起{query_rounds}轮查询来获取{profile.nickname}的聊天记录..."
+            f"正在发起{query_rounds}轮查询来获取{profile.nickname}的聊天记录(含上下文)..."
         )
 
         # ---------- 消息 ----------
@@ -89,9 +175,11 @@ class PortrayalPlugin(Star):
             yield event.plain_result("没有查询到该群友的任何消息")
             return
 
+        self._update_cooldown(target_id)
+
         yield event.plain_result(
-            f"已从{result.scanned_messages}条群消息中提取到"
-            f"{result.count}条{profile.nickname}的聊天记录，正在分析{cmd}..."
+            f"已查找到{result.scanned_messages}条群消息，提取到"
+            f"{result.count}组{profile.nickname}的对话片段，正在分析..."
         )
 
         # ---------- LLM ----------

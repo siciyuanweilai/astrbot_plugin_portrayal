@@ -1,25 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from time import time
 from typing import Any
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
-
+from astrbot.api import logger
 from .config import PluginConfig
-
-
-# =========================
-# cache models
-# =========================
-
-
-@dataclass
-class _CachedMessages:
-    texts: list[str]
-    timestamp: float
 
 
 @dataclass
@@ -40,92 +29,42 @@ class MessageQueryResult:
         return not self.texts
 
 
-# =========================
-# message manager
-# =========================
-
-
 class MessageManager:
     """
-    群级扫描 + 用户级缓存 的消息管理器
-
-    特性：
-    - 同一群查询任意用户都会复用扫描进度
-    - 扫描过程中自动缓存其他人的消息
-    - 下次查询从群断点继续
+    带上下文感知的消息管理器
     """
 
     def __init__(self, config: PluginConfig):
         self.cfg = config.message
-
-        # user cache: group:user -> messages
-        self._user_cache: dict[str, _CachedMessages] = {}
-
-        # group cursor: group -> message_seq
-        self._group_cursor: dict[str, int] = {}
-
-    # =========================
-    # cache helpers
-    # =========================
-
-    def _user_key(self, group_id: str, user_id: str) -> str:
-        return f"{group_id}:{user_id}"
-
-    def _get_user_cache(self, group_id: str, user_id: str) -> list[str] | None:
-        key = self._user_key(group_id, user_id)
-        cached = self._user_cache.get(key)
-        if not cached:
-            return None
-
-        if time() - cached.timestamp > self.cfg.cache_ttl:
-            del self._user_cache[key]
-            return None
-
-        return cached.texts
+        self.per_page_count = 100 
 
     def clear_cache(self):
-        self._user_cache.clear()
-        self._group_cursor.clear()
+        pass
 
-    # =========================
-    # message parsing
-    # =========================
+    def _get_sender_name(self, msg_data: dict[str, Any]) -> str:
+        """获取消息发送者的最佳显示名称"""
+        sender = msg_data.get("sender", {})
+        user_id = str(sender.get("user_id", ""))
+        
+        name = sender.get("card")
+        if not name:
+            name = sender.get("nickname")
+        if not name:
+            name = f"用户_{user_id[-4:]}" if user_id else "未知用户"
+        return name
 
-    def _collect_messages(
-        self,
-        group_id: str,
-        messages: list[dict[str, Any]],
-    ):
-        """
-        将一页群消息拆分并缓存到各个用户
-        """
-        now = time()
-
-        for msg in messages:
-            user_id = str(msg["sender"]["user_id"])
-
-            text = "".join(
-                seg["data"]["text"] for seg in msg["message"] if seg["type"] == "text"
+    def _extract_text(self, msg_data: dict[str, Any]) -> str:
+        """从消息对象中提取纯文本"""
+        if "message" in msg_data and isinstance(msg_data["message"], list):
+            return "".join(
+                seg["data"]["text"] 
+                for seg in msg_data["message"] 
+                if seg.get("type") == "text"
             ).strip()
-
-            if not text:
-                continue
-
-            key = self._user_key(group_id, user_id)
-            cached = self._user_cache.get(key)
-
-            if not cached:
-                self._user_cache[key] = _CachedMessages(
-                    texts=[text],
-                    timestamp=now,
-                )
-            else:
-                cached.texts.append(text)
-                cached.timestamp = now
-
-    # =========================
-    # public api
-    # =========================
+        
+        if "raw_message" in msg_data:
+            return str(msg_data["raw_message"]).strip()
+        return ""
 
     async def get_user_texts(
         self,
@@ -135,56 +74,127 @@ class MessageManager:
         max_rounds: int,
     ) -> MessageQueryResult:
         """
-        获取指定用户在群内的历史文本消息
+        获取指定用户在群内的历史文本消息（包含上下文）
         """
         group_id = str(event.get_group_id())
         target_id = str(target_id)
+        
+        all_messages = []
+        seen_ids = set() 
+        message_seq = 0 
 
-        # ---------- cache first ----------
-        cached = self._get_user_cache(group_id, target_id)
-        if cached and len(cached) >= self.cfg.max_msg_count:
-            return MessageQueryResult(
-                texts=cached[: self.cfg.max_msg_count],
-                scanned_messages=0,
-                from_cache=True,
-            )
+        logger.info(f"开始获取群 {group_id} 消息，目标用户: {target_id}，计划轮数: {max_rounds}")
 
-        texts = cached[:] if cached else []
-        rounds = 0
+        # ---------- 1. 分页拉取逻辑 ----------
+        for round_idx in range(max_rounds):
+            try:
+                if round_idx > 0:
+                    await asyncio.sleep(0.5)
 
-        # 群级扫描断点
-        message_seq = self._group_cursor.get(group_id, 0)
+                params = {
+                    "group_id": group_id,
+                    "count": self.per_page_count, 
+                    "message_seq": message_seq,
+                }
+                params["reverseOrder"] = True
 
-        # ---------- scan group messages ----------
-        while rounds < max_rounds and len(texts) < self.cfg.max_msg_count:
-            result: dict[str, Any] = await event.bot.api.call_action(
-                "get_group_msg_history",
-                group_id=group_id,
-                message_seq=message_seq,
-                count=self.cfg.per_query_count,
-                reverseOrder=True,
-            )
+                result: dict[str, Any] = await event.bot.api.call_action(
+                    "get_group_msg_history",
+                    **params
+                )
 
-            messages = result.get("messages", [])
-            if not messages:
+                messages = result.get("messages", [])
+                if not messages:
+                    break
+                
+                batch_added_count = 0
+                cursor_seqs = []
+                
+                for msg in messages:
+                    mid = msg.get("message_id")
+                    if mid is not None:
+                        mid_int = int(mid)
+                        if mid_int in seen_ids:
+                            continue
+                        seen_ids.add(mid_int)
+                        all_messages.append(msg)
+                        batch_added_count += 1
+                    else:
+                        all_messages.append(msg)
+                        batch_added_count += 1
+
+                    # --- 2. 收集用于翻页的 seq ---
+                    seq = msg.get("message_seq")
+                    if seq is None:
+                        seq = msg.get("message_id")
+                    
+                    if seq is not None:
+                        cursor_seqs.append(int(seq))
+                
+                if not cursor_seqs:
+                    break 
+
+                min_seq = min(cursor_seqs) 
+                
+                if min_seq == message_seq and round_idx > 0:
+                    break
+                
+                if batch_added_count == 0 and round_idx > 0:
+                    break
+
+                message_seq = min_seq
+
+                if len(all_messages) > max_rounds * self.per_page_count * 1.5:
+                    break
+
+            except Exception as e:
+                logger.error(f"获取群消息历史失败 (Round {round_idx}): {e}")
                 break
 
-            # 更新群扫描断点
-            message_seq = messages[0]["message_id"]
-            self._group_cursor[group_id] = message_seq
+        if not all_messages:
+            return MessageQueryResult([], 0, False)
 
-            # 关键点：这一页给所有人缓存
-            self._collect_messages(group_id, messages)
+        # ---------- 2. 预处理与排序 ----------
+        all_messages.sort(key=lambda x: int(x.get("time", 0)))
 
-            # 再取目标用户
-            cached = self._get_user_cache(group_id, target_id)
-            if cached:
-                texts = cached[:]
+        valid_entries = []
+        context_window = self.cfg.context_num
 
-            rounds += 1
+        # ---------- 3. 提取对话片段 ----------
+        for i, msg in enumerate(all_messages):
+            sender_info = msg.get("sender", {})
+            sender_id = str(sender_info.get("user_id", ""))
+            
+            if sender_id == target_id:
+                raw_text = self._extract_text(msg)
+                if not raw_text: 
+                    continue
+                
+                context_lines = []
+                start_index = max(0, i - context_window)
+                
+                for ctx_msg in all_messages[start_index:i]:
+                    c_name = self._get_sender_name(ctx_msg)
+                    c_text = self._extract_text(ctx_msg)
+                    if c_text:
+                        if len(c_text) > 50:
+                            c_text = c_text[:50] + "..."
+                        context_lines.append(f"【{c_name}】: {c_text}")
+                
+                entry_str = ""
+                if context_lines:
+                    entry_str += "\n".join(context_lines) + "\n"
+                
+                entry_str += f"【主角】: {raw_text}"
+                
+                valid_entries.append(entry_str)
+
+                if len(valid_entries) >= self.cfg.max_msg_count:
+                    break
 
         return MessageQueryResult(
-            texts=texts[: self.cfg.max_msg_count],
-            scanned_messages=rounds * self.cfg.per_query_count,
-            from_cache=cached is not None,
+            texts=valid_entries,
+            scanned_messages=len(all_messages),
+            from_cache=False,
         )
+        

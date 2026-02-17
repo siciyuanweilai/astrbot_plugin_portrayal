@@ -1,4 +1,3 @@
-# config.py
 from __future__ import annotations
 
 import yaml
@@ -17,12 +16,6 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_path
 class ConfigNode:
     """
     配置节点, 把 dict 变成强类型对象。
-
-    规则：
-    - schema 来自子类类型注解
-    - 声明字段：读写，写回底层 dict
-    - 未声明字段和下划线字段：仅挂载属性，不写回
-    - 支持 ConfigNode 多层嵌套（lazy + cache）
     """
 
     _SCHEMA_CACHE: dict[type, dict[str, type]] = {}
@@ -131,12 +124,14 @@ class MessageConfig(ConfigNode):
     default_query_rounds: int
     max_msg_count: int
     cache_ttl_min: int
+    analysis_cooldown: float
+    context_num: int  
 
     def __init__(self, data: dict[str, Any]):
         super().__init__(data)
         self.cache_ttl = self.cache_ttl_min * 60
         self.max_query_rounds = 200
-        self.per_query_count = 200
+        self.per_query_count = 100 
 
     def get_query_rounds(self, rounds=None) -> int:
         """获取查询轮数"""
@@ -165,4 +160,3 @@ class PluginConfig(ConfigNode):
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.builtin_prompt_file = self.plugin_dir / "builtin_prompts.yaml"
-
